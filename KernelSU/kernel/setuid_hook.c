@@ -13,138 +13,191 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
+#include <linux/namei.h>
 
 #include "allowlist.h"
 #include "setuid_hook.h"
-#include "feature.h"
 #include "klog.h" // IWYU pragma: keep
 #include "manager.h"
 #include "selinux/selinux.h"
+#include "seccomp_cache.h"
 #include "supercalls.h"
-#ifdef CONFIG_KSU_SYSCALL_HOOK
-#include "syscall_handler.h"
+#ifdef KSU_TP_HOOK
+#include "syscall_hook_manager.h"
 #endif
-#include "kernel_umount.h"
 #include "kernel_compat.h"
+#include "kernel_umount.h"
+#include "sulog.h"
 
-static bool ksu_enhanced_security_enabled = false;
+extern void disable_seccomp(struct task_struct *tsk);
 
-static int enhanced_security_feature_get(u64 *value)
+static inline void ksu_set_file_immutable(const char *path_name, bool immutable)
 {
-	*value = ksu_enhanced_security_enabled ? 1 : 0;
-	return 0;
+    struct path path;
+    struct inode *inode;
+    int error;
+
+    error = kern_path(path_name, LOOKUP_FOLLOW, &path);
+    if (error) {
+        return;
+    }
+
+    inode = d_inode(path.dentry);
+
+    error = mnt_want_write(path.mnt);
+    if (error) {
+        path_put(&path);
+        return;
+    }
+
+    inode_lock(inode);
+    if (immutable) {
+        inode->i_flags |= S_IMMUTABLE;
+    } else {
+        inode->i_flags &= ~S_IMMUTABLE;
+    }
+    inode_unlock(inode);
+
+    mnt_drop_write(path.mnt);
+    path_put(&path);
 }
 
-static int enhanced_security_feature_set(u64 value)
-{
-	bool enable = value != 0;
-	ksu_enhanced_security_enabled = enable;
-	pr_info("enhanced_security: set to %d\n", enable);
-	return 0;
-}
-
-static const struct ksu_feature_handler enhanced_security_handler = {
-	.feature_id = KSU_FEATURE_ENHANCED_SECURITY,
-	.name = "enhanced_security",
-	.get_handler = enhanced_security_feature_get,
-	.set_handler = enhanced_security_feature_set,
+struct ksud_status_tw {
+    struct callback_head cb;
+    uid_t new_uid;
 };
 
-static void ksu_install_manager_fd_tw_func(struct callback_head *cb)
+static inline void do_ksu_set_ksud_status(uid_t new_uid)
 {
-	ksu_install_fd();
-	kfree(cb);
+    u16 appid = new_uid % PER_USER_RANGE;
+    int signature_index = ksu_get_manager_signature_index_by_appid(appid);
+    if (signature_index != 255) {
+        ksu_set_file_immutable("/data/adb/ksud", false);
+        pr_info("Mark /data/adb/ksud read write");
+    } else {
+        ksu_set_file_immutable("/data/adb/ksud", true);
+        pr_info("Mark /data/adb/ksud read only");
+    }
 }
 
-static void do_install_manager_fd(void)
+#ifdef KSU_TP_HOOK
+static void ksud_status_tw_func(struct callback_head *cb)
 {
-	struct callback_head *cb = kzalloc(sizeof(*cb), GFP_ATOMIC);
-	if (!cb)
-		return;
-
-	cb->func = ksu_install_manager_fd_tw_func;
-	if (task_work_add(current, cb, TWA_RESUME)) {
-		kfree(cb);
-		pr_warn("install manager fd add task_work failed\n");
-	}
+    struct ksud_status_tw *tw = container_of(cb, struct ksud_status_tw, cb);
+    do_ksu_set_ksud_status(tw->new_uid);
+    kfree(tw);
 }
 
-// force_sig kcompat, TODO: move it out of core_hook.c
-// https://elixir.bootlin.com/linux/v5.3-rc1/source/kernel/signal.c#L1613
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
-#define send_sigkill() force_sig(SIGKILL)
+#endif
+
+static inline void ksu_set_ksud_status(uid_t new_uid)
+{
+#ifndef KSU_TP_HOOK
+    do_ksu_set_ksud_status(new_uid);
 #else
-#define send_sigkill() force_sig(SIGKILL, current)
-#endif
+    struct ksud_status_tw *tw;
 
-extern void disable_seccomp(void);
-int ksu_handle_setuid_common(uid_t new_uid, uid_t old_uid, uid_t new_euid)
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw)
+        return;
+
+    tw->cb.func = ksud_status_tw_func;
+    tw->new_uid = new_uid;
+
+    int err = task_work_add(current, &tw->cb, TWA_RESUME);
+    if (err) {
+        kfree(tw);
+        pr_warn("ksud lock add task_work failed\n");
+    }
+#endif
+}
+
+int ksu_handle_setuid(uid_t new_uid, uid_t old_uid, uid_t euid) // (new_euid)
 {
-#ifdef CONFIG_KSU_DEBUG
-	pr_info("handle_setuid from %d to %d\n", old_uid, new_uid);
+    // We only interest in process spwaned by zygote
+    if (!is_zygote(current_cred())) {
+        return 0;
+    }
+
+    if (old_uid != new_uid) {
+        pr_info("handle_setresuid from %d to %d\n", old_uid, new_uid);
+#if __SULOG_GATE
+        ksu_sulog_report_syscall(new_uid, NULL, "setuid", NULL);
+#endif
+    }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    if (ksu_is_manager_uid(new_uid)) {
+        pr_info("install fd for ksu manager(uid=%d)\n", new_uid);
+        ksu_mark_manager(new_uid);
+        ksu_set_ksud_status(new_uid);
+        ksu_install_fd();
+        spin_lock_irq(&current->sighand->siglock);
+        ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+#ifdef KSU_TP_HOOK
+        ksu_set_task_tracepoint_flag(current);
+#endif
+        spin_unlock_irq(&current->sighand->siglock);
+        return 0;
+    }
+
+    if (ksu_is_allow_uid_for_current(new_uid)) {
+        if (current->seccomp.mode == SECCOMP_MODE_FILTER &&
+            current->seccomp.filter) {
+            spin_lock_irq(&current->sighand->siglock);
+            ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);
+            spin_unlock_irq(&current->sighand->siglock);
+        }
+#ifdef KSU_TP_HOOK
+        ksu_set_task_tracepoint_flag(current);
+#endif
+    }
+#ifdef KSU_TP_HOOK
+    else {
+        ksu_clear_task_tracepoint_flag_if_needed(current);
+    }
 #endif
 
-	// if old process is root, ignore it.
-	if (old_uid != 0 && ksu_enhanced_security_enabled) {
-		// disallow any non-ksu domain escalation from non-root to root!
-		// euid is what we care about here as it controls permission
-		if (unlikely(new_euid == 0) && !is_ksu_domain()) {
-			pr_warn("find suspicious EoP: %d %s, from %d to %d\n",
-				current->pid, current->comm, old_uid, new_uid);
-			send_sigkill();
-			return 0;
-		}
-		// disallow appuid decrease to any other uid if it is not allowed to su
-		if (is_appuid(old_uid) && new_euid < current_euid().val &&
-		    !ksu_is_allow_uid_for_current(old_uid)) {
-			pr_warn("find suspicious EoP: %d %s, from %d to %d\n",
-				current->pid, current->comm, old_uid, new_euid);
-			send_sigkill();
-			return 0;
-		}
-		return 0;
-	}
+#else // #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    if (ksu_is_allow_uid_for_current(new_uid)) {
+        spin_lock_irq(&current->sighand->siglock);
+        disable_seccomp(current);
+        spin_unlock_irq(&current->sighand->siglock);
 
-	if (ksu_get_manager_appid() == new_uid % PER_USER_RANGE) {
-		spin_lock_irq(&current->sighand->siglock);
-		disable_seccomp();
-#ifdef CONFIG_KSU_SYSCALL_HOOK
-		ksu_set_task_tracepoint_flag(current);
+        if (ksu_is_manager_uid(new_uid)) {
+            pr_info("install fd for ksu manager(uid=%d)\n", new_uid);
+            ksu_mark_manager(new_uid);
+            ksu_set_ksud_status(new_uid);
+            ksu_install_fd();
+        }
+
+        return 0;
+    }
+#endif // #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+
+    // Handle kernel umount
+    ksu_handle_umount(old_uid, new_uid);
+
+    return 0;
+}
+
+int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)
+{
+#ifdef CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK
+    return 0; // dummy hook here
+#else
+    // we rely on the fact that zygote always call setresuid(3) with same uids
+    return ksu_handle_setuid(ruid, current_uid().val, euid);
 #endif
-		spin_unlock_irq(&current->sighand->siglock);
-		pr_info("install fd for manager (uid=%d)\n", new_uid);
-		do_install_manager_fd();
-		return 0;
-	}
-
-	if (ksu_is_allow_uid_for_current(new_uid)) {
-		spin_lock_irq(&current->sighand->siglock);
-		disable_seccomp();
-		spin_unlock_irq(&current->sighand->siglock);
-#ifdef CONFIG_KSU_SYSCALL_HOOK
-		ksu_set_task_tracepoint_flag(current);
-	} else {
-		ksu_clear_task_tracepoint_flag_if_needed(current);
-#endif
-	}
-
-	// Handle kernel umount
-	ksu_handle_umount(old_uid, new_uid);
-
-	return 0;
 }
 
 void ksu_setuid_hook_init(void)
 {
-	ksu_kernel_umount_init();
-	if (ksu_register_feature_handler(&enhanced_security_handler)) {
-		pr_err("Failed to register enhanced security feature handler\n");
-	}
+    ksu_kernel_umount_init();
 }
 
 void ksu_setuid_hook_exit(void)
 {
-	pr_info("ksu setuid exit\n");
-	ksu_kernel_umount_exit();
-	ksu_unregister_feature_handler(KSU_FEATURE_ENHANCED_SECURITY);
+    pr_info("ksu_setuid_hook_exit\n");
+    ksu_kernel_umount_exit();
 }
