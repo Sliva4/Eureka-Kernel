@@ -45,8 +45,8 @@ obj-$(CONFIG_KPM) += kpm/
 
 REPO_NAME := ReSukiSU
 
-ccflags-y += -DKSU_VERSION=3888
-ccflags-y += -DKSU_VERSION_FULL=\"4.1.0-5fb3ab6@ReSukiSU\"
+ccflags-y += -DKSU_VERSION=34588
+ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-5fb3ab69@ReSukiSU\"
 
 ifeq ($(CONFIG_KSU_MULTI_MANAGER_SUPPORT), y)
 $(info -- Supported Unofficial Manager: MKSU, RKSU, SukiSU-Ultra, ReSukiSU )
