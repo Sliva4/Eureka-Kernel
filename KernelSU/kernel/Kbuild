@@ -48,7 +48,7 @@ ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/uapi/asm-
 obj-$(CONFIG_KSU) += kernelsu.o
 
 ccflags-y += -DKSU_VERSION=34601
-ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-bbf7636d@ReSukiSU\"
+ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-6427ba92@ReSukiSU\"
 
 ifeq ($(CONFIG_KSU_MULTI_MANAGER_SUPPORT), y)
 $(info -- Supported Unofficial Manager: MKSU, RKSU, SukiSU-Ultra, ReSukiSU )
@@ -212,7 +212,7 @@ endif
 # https://github.com/torvalds/linux/commit/5955102c9984fa081b2d570cfac75c97eecf8f3b
 # for setuid_hooks only
 # it will remove when we impl dynamic-manager feature init out of replaceable ksud
-ifeq ($(shell grep -q "inode_lock" $(srctree)/include/linux/fs.h 2>/dev/null; echo $$?),0)
+ifeq ($(shell grep -q "inode_lock.struct inode" $(srctree)/include/linux/fs.h 2>/dev/null; echo $$?),0)
 $(info -- $(REPO_NAME)/compat: inode_lock found)
 ccflags-y += -DKSU_HAS_INODE_LOCK_UNLOCK
 endif
