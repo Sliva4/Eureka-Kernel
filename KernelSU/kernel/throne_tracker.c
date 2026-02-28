@@ -88,10 +88,19 @@ struct my_dir_context {
 #define FILLDIR_ACTOR_STOP -EINVAL
 #endif
 
-FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
-                             int namelen, loff_t off, u64 ino,
-                             unsigned int d_type)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+#define MY_ACTOR_CTX_ARG struct dir_context *ctx
+#else
+#define MY_ACTOR_CTX_ARG void *ctx_void
+#endif
+
+FILLDIR_RETURN_TYPE my_actor(MY_ACTOR_CTX_ARG, const char *name, int namelen,
+                             loff_t off, u64 ino, unsigned int d_type)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+    // then pull it out of the void
+    struct dir_context *ctx = (struct dir_context *)ctx_void;
+#endif
     struct my_dir_context *my_ctx =
         container_of(ctx, struct my_dir_context, ctx);
     char dirpath[DATA_PATH_LEN];
@@ -124,7 +133,7 @@ FILLDIR_RETURN_TYPE my_actor(struct dir_context *ctx, const char *name,
             return FILLDIR_ACTOR_CONTINUE;
         }
 
-        strscpy(data->dirpath, dirpath, DATA_PATH_LEN);
+        strncpy(data->dirpath, dirpath, DATA_PATH_LEN - 1);
         data->depth = my_ctx->depth - 1;
         list_add_tail(&data->list, my_ctx->data_path_list);
     } else {
@@ -176,7 +185,7 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
     unsigned long data_app_magic = 0;
     struct apk_path_hash *pos, *n;
     struct list_head data_path_list;
-    struct data_path data;
+    struct data_path data = {};
 
     INIT_LIST_HEAD(&data_path_list);
 
@@ -186,7 +195,7 @@ void search_manager(const char *path, int depth, struct list_head *uid_data)
     }
 
     // First depth
-    strscpy(data.dirpath, path, DATA_PATH_LEN);
+    strncpy(data.dirpath, path, DATA_PATH_LEN - 1);
     data.depth = depth;
     list_add_tail(&data.list, &data_path_list);
 
@@ -281,20 +290,20 @@ void track_throne(bool prune_only, bool force_search_manager)
 
     mutex_lock(&app_list_lock);
     if (unlikely(!last_app_id_map)) {
-        last_app_id_map = ksu_bitmap_zalloc(MAX_APP_ID, GFP_KERNEL);
+        last_app_id_map = bitmap_zalloc(MAX_APP_ID, GFP_KERNEL);
     }
     mutex_unlock(&app_list_lock);
 
-    curr_app_id_map = ksu_bitmap_zalloc(MAX_APP_ID, GFP_KERNEL);
+    curr_app_id_map = bitmap_zalloc(MAX_APP_ID, GFP_KERNEL);
     if (!curr_app_id_map) {
         pr_err("track_throne: failed to allocate curr_app_id_map\n");
         return;
     }
 
-    diff_map = ksu_bitmap_zalloc(MAX_APP_ID, GFP_KERNEL);
+    diff_map = bitmap_zalloc(MAX_APP_ID, GFP_KERNEL);
     if (!diff_map) {
         pr_err("track_throne: failed to allocate diff_map\n");
-        ksu_bitmap_free(curr_app_id_map); // Free allocated memory when failed
+        bitmap_free(curr_app_id_map); // Free allocated memory when failed
         return;
     }
     INIT_LIST_HEAD(&uid_list);
@@ -408,9 +417,9 @@ out:
     }
 
     if (curr_app_id_map)
-        ksu_bitmap_free(curr_app_id_map);
+        bitmap_free(curr_app_id_map);
     if (diff_map)
-        ksu_bitmap_free(diff_map);
+        bitmap_free(diff_map);
 }
 
 void ksu_throne_tracker_init(void)

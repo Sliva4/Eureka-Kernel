@@ -10,7 +10,7 @@ kernelsu-objs += pkg_observer.o
 kernelsu-objs += setuid_hook.o
 
 ifeq ($(CONFIG_KSU_MANUAL_HOOK), y)
-ifeq ($(shell test $(VERSION) -lt 6 || { test $(VERSION) -eq 6 && test $(PATCHLEVEL) -lt 8; } && echo y),y)
+ifeq ($(shell test \( \( $(VERSION) -gt 4 -o \( $(VERSION) -eq 4 -a $(PATCHLEVEL) -ge 2 \) \) -a \( $(VERSION) -lt 6 -o \( $(VERSION) -eq 6 -a $(PATCHLEVEL) -lt 8 \) \) \) && echo y),y)
 kernelsu-objs += lsm_hooks.o
 endif
 endif
@@ -43,10 +43,8 @@ obj-$(CONFIG_KSU) += kernelsu.o
 
 obj-$(CONFIG_KPM) += kpm/
 
-REPO_NAME := ReSukiSU
-
-ccflags-y += -DKSU_VERSION=34588
-ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-5fb3ab69@ReSukiSU\"
+ccflags-y += -DKSU_VERSION=34601
+ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-d0979b0b@ReSukiSU\"
 
 ifeq ($(CONFIG_KSU_MULTI_MANAGER_SUPPORT), y)
 $(info -- Supported Unofficial Manager: MKSU, RKSU, SukiSU-Ultra, ReSukiSU )
@@ -115,11 +113,6 @@ $(info -- $(REPO_NAME)/compat: kernel_write found)
 ccflags-y += -DKSU_OPTIONAL_KERNEL_WRITE
 endif
 
-ifeq ($(shell grep -q "int\s\+path_mount" $(srctree)/fs/namespace.c; echo $$?),0)
-$(info -- $(REPO_NAME)/compat: path_mount found)
-ccflags-y += -DKSU_HAS_PATH_MOUNT
-endif
-
 ifeq ($(shell grep -q "int\s\+path_umount" $(srctree)/fs/namespace.c; echo $$?),0)
 $(info -- $(REPO_NAME)/compat: path_umount found)
 ccflags-y += -DKSU_HAS_PATH_UMOUNT
@@ -184,11 +177,32 @@ $(info -- $(REPO_NAME)/compat: proc_ops found)
 ccflags-y += -DKSU_COMPAT_HAS_PROC_OPS
 endif
 
-# Bitmap zalloc
-# https://github.com/torvalds/linux/commit/c42b65e363ce97a828f81b59033c3558f8fa7f70
-ifeq ($(shell grep -q "bitmap_zalloc" $(srctree)/include/linux/bitmap.h; echo $$?),0)
-$(info -- $(REPO_NAME)/compat: bitmap_zalloc found)
-ccflags-y += -DKSU_COMPAT_HAS_BITMAP_ALLOC_HELPER
+# Function ns_get_path check
+# for kernel 3.19-
+ifeq ($(shell grep -q "ns_get_path" $(srctree)/fs/nsfs.c; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: ns_get_path found)
+ccflags-y += -DKSU_COMPAT_HAS_NS_GET_PATH
+endif
+
+# Modern dentry_open check
+# add . to skip (, avoid build failed
+# for kernel 3.6-
+ifeq ($(shell grep -q "dentry_open.const struct path" $(srctree)/include/linux/fs.h; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: modern dentry_open found)
+ccflags-y += -DKSU_COMPAT_HAS_MODERN_DENTRY_OPEN
+endif
+
+ifeq ($(shell grep -q "^extern void ext4_unregister_sysfs" $(srctree)/fs/ext4/ext4.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: ext4_unregister_sysfs found)
+ccflags-y += -DKSU_HAS_MODERN_EXT4
+endif
+
+# The FUCKING Sulog logic require that
+# it need the whole rewrite
+# Introduce in linux kernel 4.8
+ifeq ($(shell grep -q "time64_to_tm" $(srctree)/include/linux/time.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: time64_to_tm found)
+ccflags-y += -DKSU_HAS_TIME64
 endif
 
 # Custom Signs
@@ -225,13 +239,11 @@ ifeq ($(CONFIG_KSU_MANUAL_HOOK), y)
 
   ifeq ($(CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK), y)
     $(info -- $(REPO_NAME)/manual_hook: You are using LSM hooks for setuid hooks.)
-    ifeq ($(VERSION),6)
-      ifeq ($(shell test $(PATCHLEVEL) -ge 8 && echo y),y)
-        $(info -- You can't use LSM hooks for kernel version higher than 6.8)
+    ifeq ($(shell test \( \( $(VERSION) -gt 6 \) -o \( $(VERSION) -eq 6 -a $(PATCHLEVEL) -ge 8 \) \) -o \( \( $(VERSION) -lt 4 \) -o \( $(VERSION) -eq 4 -a $(PATCHLEVEL) -lt 2 \) \) && echo y),y)
+        $(info -- You can't use LSM hooks for kernel version >=6.8 or <4.2)
         $(info -- You should turn off CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK and manually setresuid hook)
         $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
-        $(error You can't use LSM hooks when kernel version >= 6.8)
-      endif
+        $(error You can't use LSM hooks when kernel version >= 6.8 or <4.2)
     endif
   else
     $(info -- $(REPO_NAME)/manual_hook: You are using manually setresuid hook for setuid hooks.)
@@ -247,13 +259,11 @@ ifeq ($(CONFIG_KSU_MANUAL_HOOK), y)
 
   ifeq ($(CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK), y)
     $(info -- $(REPO_NAME)/manual_hook: You are using LSM hooks for init rc hooks.)
-    ifeq ($(VERSION),6)
-      ifeq ($(shell test $(PATCHLEVEL) -ge 8 && echo y),y)
-        $(info -- You can't use LSM hooks for kernel version higher than 6.8)
-        $(info -- You should turn off CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK and manually sys_read hook)
+    ifeq ($(shell test \( \( $(VERSION) -gt 6 \) -o \( $(VERSION) -eq 6 -a $(PATCHLEVEL) -ge 8 \) \) -o \( \( $(VERSION) -lt 4 \) -o \( $(VERSION) -eq 4 -a $(PATCHLEVEL) -lt 2 \) \) && echo y),y)
+        $(info -- You can't use LSM hooks for kernel version >=6.8 or <4.2)
+        $(info -- You should turn off CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK and manually setresuid hook)
         $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
-        $(error You can't use LSM hooks when kernel version >= 6.8)
-      endif
+        $(error You can't use LSM hooks when kernel version >= 6.8 or <4.2)
     endif
   else
     $(info -- $(REPO_NAME)/manual_hook: You are using manually sys_read hook for init rc hooks.)
