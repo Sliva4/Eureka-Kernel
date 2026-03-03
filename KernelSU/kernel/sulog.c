@@ -3,7 +3,9 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#ifdef KSU_TP_HOOK
 #include <linux/task_work.h>
+#endif
 #include <linux/time.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -53,13 +55,16 @@ static const struct ksu_feature_handler sulog_handler = {
 
 static void get_timestamp(char *buf, size_t len)
 {
-    struct timespec64 ts;
     struct tm tm;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0) || defined(KSU_HAS_TIME64)
+    struct timespec64 ts;
 
     ktime_get_real_ts64(&ts);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0) || defined(KSU_HAS_TIME64)
     time64_to_tm(ts.tv_sec - sys_tz.tz_minuteswest * 60, 0, &tm);
 #else
+    struct timespec ts;
+
+    ktime_get_real_ts(&ts);
     time_to_tm(ts.tv_sec - sys_tz.tz_minuteswest * 60, 0, &tm);
 #endif
 
@@ -137,7 +142,12 @@ static bool dedup_should_print(uid_t uid, u8 type, const char *content,
         .uid = uid,
         .type = type,
     };
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 17, 0) ||                          \
+    defined(KSU_HAS_TIME_HELPER)
     u64 now = ktime_get_ns();
+#else
+    u64 now = ktime_to_ns(ktime_get());
+#endif
     u64 delta_ns = (u64)DEDUP_SECS * (u64)NSEC_PER_SEC;
 
     u32 idx = key.crc & (SULOG_COMM_LEN - 1);
@@ -180,12 +190,12 @@ static void sulog_process_queue(void)
         goto revert_creds_out;
     }
 
-    if (fp->f_inode->i_size > SULOG_MAX_SIZE) {
+    if (file_inode(fp)->i_size > SULOG_MAX_SIZE) {
         if (vfs_truncate(&fp->f_path, 0))
             pr_err("sulog: failed to truncate log file\n");
         pos = 0;
     } else {
-        pos = fp->f_inode->i_size;
+        pos = file_inode(fp)->i_size;
     }
 
     list_for_each_entry (entry, &local_queue, list)
@@ -204,6 +214,7 @@ revert_creds_out:
     }
 }
 
+#ifdef KSU_TP_HOOK
 static void sulog_task_work_handler(struct callback_head *work)
 {
     sulog_process_queue();
@@ -239,6 +250,7 @@ static void sulog_schedule_task_work(void)
 put_task:
     put_task_struct(tsk);
 }
+#endif
 
 static void sulog_add_entry(char *log_buf, size_t len, uid_t uid, u8 dedup_type)
 {
@@ -261,7 +273,7 @@ static void sulog_add_entry(char *log_buf, size_t len, uid_t uid, u8 dedup_type)
     list_add_tail(&entry->list, &sulog_queue);
     spin_unlock_irqrestore(&dedup_lock, flags);
 
-    sulog_schedule_task_work();
+    sulog_process_queue();
 }
 
 void ksu_sulog_report_su_grant(uid_t uid, const char *comm, const char *method)

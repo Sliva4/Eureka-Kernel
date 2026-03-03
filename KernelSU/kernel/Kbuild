@@ -43,12 +43,11 @@ ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-v
 ccflags-y += -Wno-int-to-pointer-cast -Wno-declaration-after-statement
 
 ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
-ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/uapi/asm-generic/errno.h
 
 obj-$(CONFIG_KSU) += kernelsu.o
 
-ccflags-y += -DKSU_VERSION=34601
-ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-6427ba92@ReSukiSU\"
+ccflags-y += -DKSU_VERSION=34588
+ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-cff234f8@ReSukiSU\"
 
 ifeq ($(CONFIG_KSU_MULTI_MANAGER_SUPPORT), y)
 $(info -- Supported Unofficial Manager: MKSU, RKSU, SukiSU-Ultra, ReSukiSU )
@@ -196,9 +195,22 @@ $(info -- $(REPO_NAME)/compat: modern dentry_open found)
 ccflags-y += -DKSU_COMPAT_HAS_MODERN_DENTRY_OPEN
 endif
 
+# UL, look for "ext4_unregister_sysfs" on fs/ext4
 ifeq ($(shell grep -q "^extern void ext4_unregister_sysfs" $(srctree)/fs/ext4/ext4.h 2>/dev/null; echo $$?),0)
 $(info -- $(REPO_NAME)/compat: ext4_unregister_sysfs found)
 ccflags-y += -DKSU_HAS_MODERN_EXT4
+endif
+
+# UL, look for read_iter on f_op struct
+ifeq ($(shell grep -q "read_iter" $(srctree)/include/linux/fs.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: f_op->read_iter found)
+ccflags-y += -DKSU_HAS_FOP_READ_ITER
+endif
+
+# UL, look for iterate_dir on fs/readdir.c
+ifeq ($(shell grep -q "^int iterate_dir" $(srctree)/fs/readdir.c 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: iterate_dir found)
+ccflags-y += -DKSU_HAS_ITERATE_DIR
 endif
 
 # The FUCKING Sulog logic require that
@@ -209,12 +221,51 @@ $(info -- $(REPO_NAME)/compat: time64_to_tm found)
 ccflags-y += -DKSU_HAS_TIME64
 endif
 
+ifeq ($(shell grep -q "ktime_get_ns" $(srctree)/include/linux/timekeeping.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: ktime_get_ns found)
+ccflags-y += -DKSU_HAS_TIME_HELPER
+endif
+
+ifeq ($(shell grep -q "get_cmdline" $(srctree)/mm/util.c 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: get_cmdline found)
+ccflags-y += -DKSU_HAS_GET_CMDLINE
+endif
+
 # https://github.com/torvalds/linux/commit/5955102c9984fa081b2d570cfac75c97eecf8f3b
 # for setuid_hooks only
 # it will remove when we impl dynamic-manager feature init out of replaceable ksud
 ifeq ($(shell grep -q "inode_lock.struct inode" $(srctree)/include/linux/fs.h 2>/dev/null; echo $$?),0)
 $(info -- $(REPO_NAME)/compat: inode_lock found)
 ccflags-y += -DKSU_HAS_INODE_LOCK_UNLOCK
+endif
+
+# for kernel version below 3.7, uapi/asm-generic/errno.h maybe not found
+ifneq ($(wildcard $(srctree)/include/uapi/asm-generic/errno.h),)
+$(info -- $(REPO_NAME)/compat: modern errno file found)
+ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/uapi/asm-generic/errno.h
+else
+ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/asm-generic/errno.h
+endif
+
+# for kernel version below 3.14, linux/proc_ns.h maybe not found
+# https://github.com/torvalds/linux/commit/0bb80f240520c4148b623161e7856858c021696d
+ifneq ($(wildcard $(srctree)/include/linux/proc_ns.h),)
+$(info -- $(REPO_NAME)/compat: modern proc ns header file found)
+ccflags-y += -DKSU_HAS_MODERN_PROC_NS
+endif
+
+# for kernel version below 3.8, fsnotify_destroy_mark may don't have fsnotify_group param
+# https://github.com/torvalds/linux/commit/e2a29943e9a2ee2aa737a77f550f46ba72269db4
+ifeq ($(shell grep -q "given a group and a mark" $(srctree)/include/linux/fsnotify_backend.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: modern fsnotify_destroy_mark found)
+ccflags-y += -DKSU_HAS_MODERN_FSNOTIFY_DESTROY_MARK
+endif
+
+# for kernel version below 4.0, d_inode may not found
+# https://github.com/torvalds/linux/commit/155e35d4daa804582f75acaa2c74ec797a89c615
+ifeq ($(shell grep -q "static inline struct inode..d_inode" $(srctree)/include/linux/dcache.h 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: d_inode found)
+ccflags-y += -DKSU_HAS_D_INODE
 endif
 
 # Custom Signs
@@ -356,9 +407,21 @@ ifeq ($(CONFIG_KSU_MANUAL_HOOK), y)
   ifeq ($(shell grep -q "ksu_handle_sys_reboot" $(srctree)/kernel/reboot.c; echo $$?),0)
     $(info -- $(REPO_NAME)/manual_hook: ksu_handle_sys_reboot found)
   else
-    $(info -- You lost ksu_handle_sys_reboot hook in your kernel)
-    $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
-    $(error You should integrate $(REPO_NAME) in your kernel.)
+    ifeq ($(shell test \( $(VERSION) -lt 3 -o \( $(VERSION) -eq 3 -a $(PATCHLEVEL) -le 11 \) \) && echo y),y)
+      # https://github.com/torvalds/linux/commit/15d94b82565ebfb0cf27830b96e6cf5ed2d12a9a
+      # when 3.11-, it maybe in kernel/sys.c
+      ifeq ($(shell grep -q "ksu_handle_sys_reboot" $(srctree)/kernel/sys.c; echo $$?),0)
+        $(info -- $(REPO_NAME)/manual_hook: ksu_handle_sys_reboot found)
+      else
+        $(info -- You lost ksu_handle_sys_reboot hook in your kernel)
+        $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
+        $(error You should integrate $(REPO_NAME) in your kernel.)
+      endif
+    else
+      $(info -- You lost ksu_handle_sys_reboot hook in your kernel)
+      $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
+      $(error You should integrate $(REPO_NAME) in your kernel.)
+    endif
   endif
 endif
 
