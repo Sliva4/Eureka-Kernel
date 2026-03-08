@@ -6,14 +6,7 @@ kernelsu-objs += apk_sign.o
 kernelsu-objs += sucompat.o
 
 kernelsu-objs += throne_tracker.o
-kernelsu-objs += pkg_observer.o
 kernelsu-objs += setuid_hook.o
-
-ifeq ($(CONFIG_KSU_MANUAL_HOOK), y)
-ifeq ($(shell test \( \( $(VERSION) -gt 4 -o \( $(VERSION) -eq 4 -a $(PATCHLEVEL) -ge 2 \) \) -a \( $(VERSION) -lt 6 -o \( $(VERSION) -eq 6 -a $(PATCHLEVEL) -lt 8 \) \) \) && echo y),y)
-kernelsu-objs += lsm_hooks.o
-endif
-endif
 
 kernelsu-objs += kernel_compat.o
 kernelsu-objs += kernel_umount.o
@@ -46,8 +39,50 @@ ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
 
 obj-$(CONFIG_KSU) += kernelsu.o
 
-ccflags-y += -DKSU_VERSION=34588
-ccflags-y += -DKSU_VERSION_FULL=\"v4.1.0-cff234f8@ReSukiSU\"
+REPO_NAME := ReSukiSU
+
+KDIR := $(KDIR)
+
+GIT_BIN := /usr/bin/env PATH="$$PATH":/usr/bin:/usr/local/bin git
+CURL_BIN := /usr/bin/env PATH="$$PATH":/usr/bin:/usr/local/bin curl
+
+KSU_SRC := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+
+LOCAL_GIT_EXISTS := $(shell test -e $(KSU_SRC)/../.git && echo 1 || echo 0)
+
+ifeq ($(LOCAL_GIT_EXISTS),0)
+$(info -- Can't found $(REPO_NAME) git submodule!)
+$(info -- If you are using bazel to build this kernel,)
+$(info -- Please goto Kbuild and change KSU_SRC to the absolute path of ksu kernel folder path)
+$(error You should use $(REPO_NAME) as an git submodule instead of directly copy code)
+endif
+
+$(shell cd $(KSU_SRC); [ -f ../.git/shallow ] && $(GIT_BIN) fetch --unshallow)
+KSU_LOCAL_VERSION := $(shell cd $(KSU_SRC); $(GIT_BIN) rev-list --count HEAD)
+KSU_VERSION := $(shell expr 30000 + $(KSU_LOCAL_VERSION) + 700)
+
+KSU_TAG_NAME    := $(shell cd $(KSU_SRC); $(GIT_BIN) describe --abbrev=0 --tags 2>/dev/null || echo "unknown")
+KSU_COMMIT_SHA  := $(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD 2>/dev/null || echo "unknown")
+KSU_BRANCH_NAME := $(shell cd $(KSU_SRC); $(GIT_BIN) branch --show-current 2>/dev/null || echo "unknown")
+
+# make ddk happy
+ifneq ($(KDIR),)
+CONFIG_KSU_FULL_NAME_FORMAT := "%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"
+endif
+
+# call subst to process placeholder
+KSU_VERSION_FULL := $(subst ",,$(CONFIG_KSU_FULL_NAME_FORMAT))
+KSU_VERSION_FULL := $(subst %TAG_NAME%,$(KSU_TAG_NAME),$(KSU_VERSION_FULL))
+KSU_VERSION_FULL := $(subst %COMMIT_SHA%,$(KSU_COMMIT_SHA),$(KSU_VERSION_FULL))
+KSU_VERSION_FULL := $(subst %REPO_NAME%,$(REPO_NAME),$(KSU_VERSION_FULL))
+KSU_VERSION_FULL := $(subst %BRANCH_NAME%,$(KSU_BRANCH_NAME),$(KSU_VERSION_FULL))
+KSU_VERSION_FULL := $(subst %KSU_VERSION%,$(KSU_VERSION),$(KSU_VERSION_FULL))
+
+$(info -- $(REPO_NAME) version code: $(KSU_VERSION))
+$(info -- $(REPO_NAME) version name: $(KSU_VERSION_FULL))
+
+ccflags-y += -DKSU_VERSION=$(KSU_VERSION)
+ccflags-y += -DKSU_VERSION_FULL=\"$(KSU_VERSION_FULL)\"
 
 ifeq ($(CONFIG_KSU_MULTI_MANAGER_SUPPORT), y)
 $(info -- Supported Unofficial Manager: MKSU, RKSU, SukiSU-Ultra, ReSukiSU )
@@ -86,8 +121,23 @@ $(info -- KPM is disabled)
 endif
 
 ifeq ($(KSU_TP_HOOK), y)
+kernelsu-objs += pkg_observer.o
 kernelsu-objs += syscall_hook_manager.o
 kernelsu-objs += util.o
+else
+# For old kernel, pkg observer maybe let system freeze
+# https://github.com/ReSukiSU/ReSukiSU/issues/82#issuecomment-4015396974
+#
+# 4.2- we let user manual hook security.c to call ksu_handle_rename
+# 4.2-6.7 we use lsm_hooks to call ksu_handle_rename
+# 6.8+ we use pkg_observer to track_throne
+ifeq ($(shell test \( $(VERSION) -gt 4 -o \( $(VERSION) -eq 4 -a $(PATCHLEVEL) -ge 2 \) \) && echo y),y)
+    ifeq ($(shell test \( $(VERSION) -lt 6 -o \( $(VERSION) -eq 6 -a $(PATCHLEVEL) -lt 8 \) \) && echo y),y)
+        kernelsu-objs += lsm_hooks.o
+    else
+        kernelsu-objs += pkg_observer.o
+    endif
+endif
 endif
 
 # SELinux drivers check
@@ -421,6 +471,24 @@ ifeq ($(CONFIG_KSU_MANUAL_HOOK), y)
       $(info -- You lost ksu_handle_sys_reboot hook in your kernel)
       $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
       $(error You should integrate $(REPO_NAME) in your kernel.)
+    endif
+  endif
+
+  ifeq ($(shell test \( $(VERSION) -lt 4 -o \( $(VERSION) -eq 4 -a $(PATCHLEVEL) -le 2 \) \) && echo y),y)
+    # 4.2-, check ksu_handle_rename manual hook
+    ifeq ($(shell grep -q "ksu_handle_rename" $(srctree)/security/security.c; echo $$?),0)
+      $(info -- $(REPO_NAME)/manual_hook: ksu_handle_rename found)
+    else
+      $(info -- You lost ksu_handle_rename hook in your kernel)
+      $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
+      $(error You should integrate $(REPO_NAME) in your kernel.)
+    endif
+  else
+    # 4.2+, user manual hook ksu_handle_rename will let track_throne scan twice
+    ifeq ($(shell grep -q "ksu_handle_rename" $(srctree)/security/security.c; echo $$?),0)
+      $(info -- ksu_handle_rename is incompatible hook)
+      $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
+      $(error You should integrate $(REPO_NAME) in your kernel correctly.)
     endif
   endif
 endif
